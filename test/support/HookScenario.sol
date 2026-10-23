@@ -15,6 +15,7 @@ import {LaunchHook} from "src/LaunchHook.sol";
 import {LaunchToken} from "src/LaunchToken.sol";
 import {Swapper} from "../mocks/Swapper.sol";
 import {SwapProbe} from "./SwapProbe.sol";
+import {PartialFillRevert} from "./PartialFillRevert.sol";
 
 abstract contract HookScenario is Test {
     using TransientStateLibrary for IPoolManager;
@@ -106,9 +107,14 @@ abstract contract HookScenario is Test {
     }
 
     function _assertPaidSwap(bool buy, int256 specified, uint256 rate) internal {
+        _assertPaidLimitedSwap(buy, specified, _params(buy, specified).sqrtPriceLimitX96, rate, true);
+    }
+
+    /// @dev `full == false` requires a genuine partial fill: the specified leg moved, but less than asked.
+    function _assertPaidLimitedSwap(bool buy, int256 specified, uint160 limit, uint256 rate, bool full) internal {
         Balances memory before_ = _balances();
         vm.recordLogs();
-        BalanceDelta actual = trader.swap(pool, _params(buy, specified));
+        BalanceDelta actual = trader.swap(pool, SwapParams(buy, specified, limit));
         (int128 ammEth, int128 ammToken) = _ammDelta(vm.getRecordedLogs());
         Balances memory after_ = _balances();
         uint256 fee = (after_.vaultEth - before_.vaultEth) + (after_.devEth - before_.devEth);
@@ -126,12 +132,41 @@ abstract contract HookScenario is Test {
         assertEq(int256(ammEth) - int256(actual.amount0()), int256(fee), "only fee modifies ETH delta");
         assertEq(int256(after_.managerToken) - int256(before_.managerToken), -int256(ammToken));
         assertEq(int256(after_.managerEth) - int256(before_.managerEth), -int256(ammEth));
-        if (specified < 0) assertEq(buy ? actual.amount0() : actual.amount1(), specified, "full exact input");
-        else assertEq(buy ? actual.amount1() : actual.amount0(), specified, "exact output");
+        int128 filled =
+            specified < 0 ? (buy ? actual.amount0() : actual.amount1()) : (buy ? actual.amount1() : actual.amount0());
+        if (full) {
+            assertEq(filled, specified, specified < 0 ? "full exact input" : "exact output");
+        } else {
+            assertTrue(filled != 0, "partial fill must move the specified leg");
+            if (specified < 0) assertGt(filled, specified, "partial exact input spends less than asked");
+            else assertLt(filled, specified, "partial exact output receives less than asked");
+        }
         assertEq(launchHook.owed(vaultRecipient), 0);
         assertEq(launchHook.owed(devRecipient), 0);
         assertEq(launchHook.pendingClaims(), 0);
         assertEq(address(launchHook).balance, 0);
+        _assertSettled();
+    }
+
+    /// @dev A swap the hook must refuse as a partial fill. Returns the hook's reported amounts; nothing moves.
+    function _expectPartialFill(bool buy, int256 specified, uint160 limit)
+        internal
+        returns (uint256 assumed, uint256 executed)
+    {
+        Balances memory before_ = _balances();
+        uint256 vaultCredit = launchHook.owed(vaultRecipient);
+        uint256 devCredit = launchHook.owed(devRecipient);
+        try trader.swap(pool, SwapParams(buy, specified, limit)) {
+            fail("partial fill with ETH specified must revert");
+        } catch (bytes memory reason) {
+            bool ok;
+            (ok, assumed, executed) = PartialFillRevert.decode(reason, address(launchHook));
+            assertTrue(ok, "revert must be the hook's PartialFill");
+        }
+        assertLt(executed, assumed, "the pool swapped less ETH than the fee was sized for");
+        assertEq(abi.encode(_balances()), abi.encode(before_), "a refused fill moves nothing");
+        assertEq(launchHook.owed(vaultRecipient), vaultCredit);
+        assertEq(launchHook.owed(devRecipient), devCredit);
         _assertSettled();
     }
 

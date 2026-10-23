@@ -10,10 +10,12 @@ import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {LaunchHook} from "src/LaunchHook.sol";
 import {LaunchToken} from "src/LaunchToken.sol";
 import {HookScenario} from "./support/HookScenario.sol";
 import {SwapProbe} from "./support/SwapProbe.sol";
+import {PartialFillRevert} from "./support/PartialFillRevert.sol";
 import {ToggleVault, IPullable} from "./mocks/Recipients.sol";
 
 contract ForceFeeDonation {
@@ -25,6 +27,7 @@ contract ForceFeeDonation {
 /// @notice Drives real swaps, credit withdrawals, redemptions, fee changes and ownership changes.
 /// Ghost fees derive from actual AMM deltas and actual trader deltas, not hook accounting/events.
 contract FeeAccountingHandler is Test {
+    using StateLibrary for IPoolManager;
     bytes32 private constant SWAP_EVENT = keccak256("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)");
     IPoolManager public immutable pm;
     LaunchHook public immutable hook;
@@ -43,6 +46,8 @@ contract FeeAccountingHandler is Test {
     uint256 public donatedTokens;
     uint256 public successfulSwaps;
     uint256 public withdrawals;
+    uint256 public partialFills;
+    uint256 public refusedFills;
     uint16 public lastLaunch = 3000;
     uint16 public lastBase = 200;
 
@@ -66,32 +71,102 @@ contract FeeAccountingHandler is Test {
     }
 
     function trade(uint256 actorSeed, uint256 amountSeed, bool buy, bool exactInput) external {
-        // Keep this model in the full-fill domain. Partial fills have a separate failing proof.
-        // Sells use at most 1/4 of measured AMM ETH reserves, so liquidity exhaustion cannot mask bugs.
-        if (poolEth < 1e8) buy = true;
+        // Extreme price limits. Sells are sized from measured AMM ETH, but part of that ETH is LP fees the
+        // swap cannot pay out, so an exact-output sell may still meet an exhausted pool: the hook must then
+        // refuse it with PartialFill. A buy at the extreme limit always has TEST depth and must fill.
+        if (poolEth < 1e8 || _atTopPrice()) buy = true;
         uint256 maximum = buy || poolEth / 4 > 0.5 ether ? 0.5 ether : poolEth / 4;
         uint256 amount = bound(amountSeed, 1e6, maximum);
-        SwapProbe actor = actors[actorSeed % 3];
-        uint256 rate = buy ? _expectedBuyRate() : hook.baseFeeBps();
-        vm.recordLogs();
-        BalanceDelta delta = actor.swap(
-            pool,
+        bool refused = _execute(
+            actors[actorSeed % 3],
             SwapParams(
                 buy,
                 exactInput ? -int256(amount) : int256(amount),
                 buy ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
             )
         );
-        int128 ammEth = _readAmmEth(vm.getRecordedLogs());
-        uint256 fee = uint256(int256(ammEth) - int256(delta.amount0()));
-        uint256 gross = buy ? uint256(-int256(delta.amount0())) : uint256(uint128(ammEth));
-        assertLe(fee * 10000, gross * rate, "actual fee exceeds schedule");
-        assertLt(gross * rate - fee * 10000, 10000, "actual fee undercharged");
-        uint256 devShare = gross / 200;
-        expectedDev += devShare;
-        expectedVault += fee - devShare;
-        poolEth = uint256(int256(poolEth) - int256(ammEth));
-        ++successfulSwaps;
+        if (refused) assertFalse(buy, "an extreme-limit buy never runs out of TEST");
+    }
+
+    /// @dev Price-limited swaps of every type, sized up to twice the pool's ETH so both stop conditions
+    /// (limit reached, ETH exhausted) occur. ETH-specified swaps must fill fully or revert with PartialFill;
+    /// ETH-unspecified swaps may fill partially and are charged on the executed ETH.
+    function limitedTrade(uint256 actorSeed, uint256 amountSeed, uint256 limitSeed, bool buy, bool exactInput)
+        external
+    {
+        if (poolEth < 1e8 || _atTopPrice()) buy = true;
+        uint256 amount = bound(amountSeed, 1e6, buy ? 2 ether : 2 * poolEth);
+        SwapProbe actor = actors[actorSeed % 3];
+        if (!buy && exactInput && amount > token.balanceOf(address(actor))) amount = token.balanceOf(address(actor));
+        (uint160 price,,,) = pm.getSlot0(pool.toId());
+        // Relative moves from 1e-12 to 1e-6 span fills from dust to several ETH at this pool's depth.
+        uint256 move = price / bound(limitSeed, 1e6, 1e12);
+        uint160 limit = buy ? price - uint160(move) : price + uint160(move);
+        // An extreme-limit sell can leave the price at the top bound; there is nothing left to sell into.
+        if (!buy && limit >= TickMath.MAX_SQRT_PRICE) limit = TickMath.MAX_SQRT_PRICE - 1;
+        _execute(actor, SwapParams(buy, exactInput ? -int256(amount) : int256(amount), limit));
+    }
+
+    /// @dev An extreme-limit sell that runs past the TEST-only range leaves the price at the top bound, where
+    /// the PoolManager rejects every further sell before the hook runs.
+    function _atTopPrice() private view returns (bool) {
+        (uint160 price,,,) = pm.getSlot0(pool.toId());
+        return price >= TickMath.MAX_SQRT_PRICE - 1;
+    }
+
+    /// @dev One real swap. Success: the fee is checked against the executed ETH and booked. Failure: only the
+    /// hook's PartialFill on an ETH-specified swap is acceptable, and the whole swap is undone.
+    function _execute(SwapProbe actor, SwapParams memory p) private returns (bool refused) {
+        bool buy = p.zeroForOne;
+        bool ethSpecified = (p.amountSpecified < 0) == buy;
+        uint256 rate = buy ? _expectedBuyRate() : hook.baseFeeBps();
+        uint256 managerEth = address(pm).balance;
+        vm.recordLogs();
+        try actor.swap(pool, p) returns (BalanceDelta delta) {
+            int128 ammEth = _readAmmEth(vm.getRecordedLogs());
+            int128 filled = ethSpecified ? delta.amount0() : delta.amount1();
+            if (ethSpecified) assertEq(filled, p.amountSpecified, "ETH-specified swaps only ever fill fully");
+            else if (filled != p.amountSpecified) ++partialFills;
+            uint256 fee = uint256(int256(ammEth) - int256(delta.amount0()));
+            uint256 gross = buy ? uint256(-int256(delta.amount0())) : uint256(uint128(ammEth));
+            assertLe(fee * 10000, gross * rate, "fee exceeds the rate on executed ETH");
+            assertLt(gross * rate - fee * 10000, 10000, "fee undercharged on executed ETH");
+            expectedDev += gross / 200;
+            expectedVault += fee - gross / 200;
+            poolEth = uint256(int256(poolEth) - int256(ammEth));
+            ++successfulSwaps;
+        } catch (bytes memory reason) {
+            (bool ok, uint256 assumed, uint256 executed) = PartialFillRevert.decode(reason, address(hook));
+            assertTrue(ok, "only the hook's PartialFill may refuse a swap");
+            assertTrue(ethSpecified, "only ETH-specified swaps are refused");
+            assertLt(executed, assumed);
+            assertEq(address(pm).balance, managerEth, "a refused swap moves no ETH");
+            ++refusedFills;
+            refused = true;
+        }
+    }
+
+    /// @dev Anyone may deliver a recipient's credit, only ever to the recipient itself.
+    function deliver(uint8 recipientSeed) external {
+        ToggleVault recipient = recipientSeed % 2 == 0 ? vault : dev;
+        uint256 credit = hook.owed(address(recipient));
+        uint256 before_ = address(recipient).balance;
+        uint256 outsiderBefore = outsider.balance;
+        vm.prank(outsider);
+        if (credit == 0) {
+            vm.expectRevert(LaunchHook.NothingOwed.selector);
+            hook.withdrawFor(address(recipient));
+        } else if (!recipient.accepting()) {
+            vm.expectRevert(LaunchHook.WithdrawFailed.selector);
+            hook.withdrawFor(address(recipient));
+            assertEq(hook.owed(address(recipient)), credit, "failed delivery must preserve credit");
+        } else {
+            hook.withdrawFor(address(recipient));
+            assertEq(address(recipient).balance - before_, credit, "deliver exactly the recipient's credit");
+            assertEq(hook.owed(address(recipient)), 0);
+            ++withdrawals;
+        }
+        assertEq(outsider.balance, outsiderBefore, "the deliverer gains nothing");
     }
 
     function toggleRecipients(bool vaultAccepting, bool devAccepting) external {
@@ -262,7 +337,7 @@ contract LaunchHookInvariantTest is HookScenario {
         handler.toggleRecipients(false, false);
         handler.trade(0, 0.1 ether, true, true);
         assertGt(launchHook.pendingClaims(), 0, "initial sequence exercises claim fallback");
-        bytes4[] memory selectors = new bytes4[](10);
+        bytes4[] memory selectors = new bytes4[](12);
         selectors[0] = handler.trade.selector;
         selectors[1] = handler.toggleRecipients.selector;
         selectors[2] = handler.pull.selector;
@@ -273,6 +348,8 @@ contract LaunchHookInvariantTest is HookScenario {
         selectors[7] = handler.ownership.selector;
         selectors[8] = handler.unauthorized.selector;
         selectors[9] = handler.donate.selector;
+        selectors[10] = handler.limitedTrade.selector;
+        selectors[11] = handler.deliver.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector(address(handler), selectors));
     }

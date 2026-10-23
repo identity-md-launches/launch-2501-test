@@ -1,18 +1,19 @@
 # TEST launch test coverage
 
 This addition preserves the accepted implementation and existing tests. New source lives only under
-`test/`. The assignment's explicitly permitted `.imd-findings.json` contains two implementation findings,
-including complete self-contained Foundry proof sources. Those proofs were executed under `test/scratch/`
-and failed for the reported reasons; they are not assertions of accepted behavior in the passing suite.
+`test/`. The first round reported two implementation findings. The implementation has since fixed the
+first (fees on unfilled ETH: ETH-specified partial fills now revert with `PartialFill`), and this revision
+tests that fix on the live PoolManager and inside the invariant campaign. The second (same-transaction
+payout on an ETH-less manager) is unchanged and is re-reported in `.imd-findings.json` at low severity.
 
 | Deliverable | Coverage |
 | --- | --- |
-| `LaunchHookFork.t.sol` | Ethereum block **26255649**, real PoolManager and specified fixed recipients; all four swap types at t=0, 1800, 3600 and 86400; rejecting-recipient recovery on a separate hook; owner restrictions; LP collection and full removal after renunciation |
+| `LaunchHookFork.t.sol` | Ethereum block **26255649**, real PoolManager and specified fixed recipients; all four swap types at t=0, 1800, 3600 and 86400; partial fills at t=0 and t=3600 (price-limited exact-input buy and exact-output sell, and an exact-output sell beyond the pool's ETH, all refused with nothing moved; price-limited exact-output buy and exact-input sell charged on executed ETH only); rejecting-recipient recovery through `withdraw` and through `withdrawFor` by a stranger; owner restrictions; LP collection and full removal after renunciation |
 | `LaunchHookIntegration.t.sol` | Offline real v4 PoolManager; four-direction matrix at t=0, 1, 1800, 3599, 3600 and 86400; 1,000 exact-output fuzz cases; multiple swap types in one unlock; rollback of a failed swap's transient state; zero-amount rejection |
 | `LaunchHookPayouts.t.sol` | Both recipients rejecting, independent credits, replayed/failed withdrawals, claim redemption rollback, withdrawal and payout reentrancy, 64 KiB return/revert data, 1,000 fee-split properties and explicit rounding edges |
-| `LaunchHookInvariant.t.sol` | Three trading actors, two switchable recipients, withdrawals, claims, time, fee reductions, rejected fee increases, ownership transfers/renunciation, unauthorized calls and forced ETH/token donations |
+| `LaunchHookInvariant.t.sol` | Three trading actors, extreme-limit and price-limited trades of all four types (partial fills and `PartialFill` refusals both occur), two switchable recipients, withdrawals, `withdrawFor` deliveries by an outsider, claims, time, fee reductions, rejected fee increases, ownership transfers/renunciation, unauthorized calls and forced ETH/token donations |
 | `LaunchTokenInvariant.t.sol` | Four holders, transfers, self-transfers, finite/infinite approvals, delegated spending, unauthorized spending, overdraws and attempted supply changes |
-| `support/HookScenario.sol`, `support/SwapProbe.sol` | Shared fixtures, real-manager event oracle, flash-accounting assertions, and a router whose entire unlock/callback/settlement runs in one external transaction |
+| `support/HookScenario.sol`, `support/SwapProbe.sol`, `support/PartialFillRevert.sol` | Shared fixtures, real-manager event oracle, flash-accounting assertions, a router whose entire unlock/callback/settlement runs in one external transaction, and a decoder that accepts only the PoolManager-wrapped `LaunchHook.PartialFill` from `afterSwap` |
 
 The existing 53 tests retain their constructor, permission, single-pool binding, metadata, supply,
 deployment-parameter and administrative coverage.
@@ -57,29 +58,30 @@ unexpected failures cannot silently count as successful exploration.
 | Every outstanding credit can be paid at the end of a sequence | `afterInvariant` enables recipient acceptance, redeems claims, and checks full payment |
 
 The hook invariant starts with an actual buy on a manager with zero ETH, ensuring that the claim path and
-nonzero debt are exercised. Random trades use bounded **full fills**; their maximum sell size is tied to
-measured pool ETH reserves. Unsupported partial fills are separately reported with failing proofs, not
-silently accepted by the invariant model. Donations are tracked explicitly, so forcing ETH through
+nonzero debt are exercised. Every trade goes through one execution path: a successful swap is charged
+against the ETH the AMM actually executed, an ETH-specified swap that succeeds must have filled fully, and
+the only acceptable revert is the hook's `PartialFill` on an ETH-specified swap, with no ETH moved.
+Measured pool ETH includes LP fees the swap cannot pay out, so an exact-output sell sized from it can meet
+an exhausted pool; the hook correctly refuses it. An extreme-limit sell past the TEST-only range parks the
+price at the top bound, where the PoolManager itself rejects further sells, so the handler buys instead. Donations are tracked explicitly, so forcing ETH through
 `SELFDESTRUCT` does not make a solvency assertion falsely demand that unsolicited funds become fee debt.
 The donation helper is test-only and intentionally produces Solidity's selfdestruct deprecation warning.
 
 ## Reported defects
 
-1. **High — fees on unfilled ETH.** A partial exact-input buy spends `300000006390771891` wei but pays
-   `300000000000000000` wei of fees. A partial exact-output sell has an ETH delta of
-   `-2040810015643196` wei while also losing TEST. The hook uses the nominal requested ETH for its
-   before-swap fee even when the AMM stops early. The proof includes working full-fill controls and allows
-   atomic rejection of unsupported partial fills as a safe repair.
-2. **Medium — same-transaction payout gap on an empty manager.** A successful first 1 ETH buy with
+1. **High — fees on unfilled ETH (fixed in the implementation).** The first round showed a partial
+   exact-input buy and exact-output sell charging the fee on ETH that was never swapped. The hook now
+   compares the pool's executed ETH with the amount it sized the fee for and reverts with `PartialFill`.
+   The fork and invariant tests above exercise the fix.
+2. **Low (was medium) — same-transaction payout gap on an empty manager.** A successful first 1 ETH buy with
    token-only liquidity pays neither accepting recipient; `0.3 ETH` remains an ERC-6909 claim until a
    later redemption. Existing mainnet ETH makes the tested funded path work. The implementation's
    documented fallback preserves value, but does not satisfy the brief's unconditional same-transaction
-   payout requirement. Claim-accounting tests verify recoverability, not compliance with that timing.
+   payout requirement. Claim-accounting tests verify recoverability, not compliance with that timing. On
+   the mainnet PoolManager at the pinned block the manager holds ample ETH and every fork swap pays out
+   directly, so the gap only matters on a manager holding less ETH than one fee.
 
-The proofs import project production contracts and existing libraries, use no fork/FFI/skips, and are
-embedded verbatim in the findings JSON. To reproduce, write each `proof` string back to its named
-`test/scratch/*.t.sol` path and run `forge test --match-path <that path> -vv`. Remove the intentionally failing
-proof files before running the normal passing suite. No implementation fix is included in this tests-only task.
+No implementation fix is included in this tests-only task.
 
 ## Reproduction
 
@@ -89,15 +91,12 @@ forge build
 forge test
 ```
 
-With the supplied `MAINNET_RPC_URL`, the seven fork tests execute against the pinned chain state. Without
+With the supplied `MAINNET_RPC_URL`, the ten fork tests execute against the pinned chain state. Without
 that variable, those tests skip and the offline suites still run. No test changes the process environment.
 All dependencies already exist as ordinary vendored files; this contribution adds no dependency or
 configuration changes. Build artifacts, caches and scratch diagnostic output are not deliverables.
 
-Final local validation on 2026-10-23: `forge build` succeeded; `forge test` reported **74 passed, 0 failed,
-0 skipped**, including all seven pinned mainnet fork tests. Each invariant campaign completed 16,384
-handler calls with zero reverts. The two new stateless fuzz properties each ran 1,000 cases with the
-specified seed. An additional isolated run with `MAINNET_RPC_URL` unset correctly skipped the fork fixture
-(Foundry reports that as one skipped `setUp`). These results exclude the three intentionally failing
-assertions embedded in the two findings. Build warnings include the intentional test-only donation helper
-and existing implementation lints; a successful build is not a resolution of the reported defects.
+Final local validation on 2026-10-23 (revision): `forge build` succeeded; `forge test` reported **91 passed,
+0 failed, 0 skipped**, including all ten pinned mainnet fork tests. The hook invariant campaign completed
+16,384 handler calls with zero reverts, and its runs include both genuine partial fills and `PartialFill`
+refusals. With `MAINNET_RPC_URL` empty the fork fixture skips (one skipped `setUp`).
