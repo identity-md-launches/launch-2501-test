@@ -1,0 +1,5 @@
+forge-std/=lib/forge-std/src/
+v4-core/=lib/v4-core/
+@uniswap/v4-core/=lib/v4-core/
+@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/
+solmate/=lib/solmate/
