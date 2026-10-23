@@ -31,7 +31,17 @@ contract Swapper is IUnlockCallback {
 
     /// @notice Swap with v4 semantics: negative `amountSpecified` is exact input, positive is exact output.
     function swapExact(PoolKey memory key, bool zeroForOne, int256 amountSpecified) public returns (BalanceDelta) {
-        bytes memory result = manager.unlock(abi.encode(ACTION_SWAP, abi.encode(key, zeroForOne, amountSpecified)));
+        uint160 limit = zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
+        return swapWithLimit(key, zeroForOne, amountSpecified, limit);
+    }
+
+    /// @notice Swap with an explicit price limit; a limit the pool reaches first leaves the swap partially filled.
+    function swapWithLimit(PoolKey memory key, bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96)
+        public
+        returns (BalanceDelta)
+    {
+        bytes memory result =
+            manager.unlock(abi.encode(ACTION_SWAP, abi.encode(key, zeroForOne, amountSpecified, sqrtPriceLimitX96)));
         return abi.decode(result, (BalanceDelta));
     }
 
@@ -51,15 +61,12 @@ contract Swapper is IUnlockCallback {
         BalanceDelta delta;
         PoolKey memory key;
         if (action == ACTION_SWAP) {
-            (PoolKey memory k, bool zeroForOne, int256 amountSpecified) = abi.decode(payload, (PoolKey, bool, int256));
+            (PoolKey memory k, bool zeroForOne, int256 amountSpecified, uint160 limit) =
+                abi.decode(payload, (PoolKey, bool, int256, uint160));
             key = k;
             delta = manager.swap(
                 key,
-                SwapParams({
-                    zeroForOne: zeroForOne,
-                    amountSpecified: amountSpecified,
-                    sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
-                }),
+                SwapParams({zeroForOne: zeroForOne, amountSpecified: amountSpecified, sqrtPriceLimitX96: limit}),
                 ""
             );
         } else {

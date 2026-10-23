@@ -29,12 +29,17 @@ import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation
 /// exact-output sell) the fee is taken in `beforeSwap` through the before-swap return delta; when ETH is the
 /// unspecified currency (exact-output buy, exact-input sell) it is taken in `afterSwap` through the after-swap
 /// return delta. The amount decided in `beforeSwap` reaches `afterSwap` through transient storage (EIP-1153).
+/// A fee sized in `beforeSwap` is checked in `afterSwap` against the ETH the pool actually swapped: an
+/// exact-input buy or exact-output sell that stops early (price limit reached, or the pool's ETH exhausted) is
+/// a partial fill and reverts with `PartialFill`, so the fee can never exceed the rate on the ETH swapped.
+/// Exact-output buys and exact-input sells size the fee from the executed amount and may fill partially.
 ///
 /// Payout happens inside the swap. The hook takes the ETH from the PoolManager and pushes it to both
 /// recipients. If the PoolManager does not hold enough ETH yet (a fresh pool seeded with tokens only, before
 /// the first buyer's ETH is settled) the hook mints itself an ERC-6909 ETH claim instead and credits the
 /// recipients; anyone may later call `redeemClaims`. If a push to a recipient fails the swap still succeeds:
-/// the amount is credited to that recipient, which pulls it with `withdraw`.
+/// the amount is credited to that recipient, which pulls it with `withdraw`; anyone may also deliver it to the
+/// recipient with `withdrawFor`.
 ///
 /// The owner may only lower `launchFeeBps` and `baseFeeBps` (never raise them, never below the dev share),
 /// and may transfer or renounce ownership. Nothing here moves liquidity, mints tokens, pauses swaps or
@@ -122,6 +127,9 @@ contract LaunchHook is IHooks, IUnlockCallback, Ownable {
     error NothingOwed();
     error WithdrawFailed();
     error NotFromPoolManager();
+    /// @notice An exact-input buy or exact-output sell stopped before its full ETH amount was swapped.
+    /// `assumed` is the pool ETH the fee was sized for, `executed` what the pool actually swapped.
+    error PartialFill(uint256 assumed, uint256 executed);
 
     modifier onlyPoolManager() {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
@@ -248,6 +256,19 @@ contract LaunchHook is IHooks, IUnlockCallback, Ownable {
         emit Withdrawn(msg.sender, to, amount);
     }
 
+    /// @notice Anyone may deliver a recipient's whole credit to that recipient, with all remaining gas. For a
+    /// recipient contract that cannot call `withdraw` itself, or whose `receive` needs more than `PAYOUT_GAS`.
+    /// The ETH can only go to the recipient, so the caller gains nothing but the delivery.
+    function withdrawFor(address recipient) external {
+        uint256 amount = owed[recipient];
+        if (amount == 0) revert NothingOwed();
+        owed[recipient] = 0;
+        if (address(this).balance < amount) _redeemClaims();
+        (bool ok,) = recipient.call{value: amount}("");
+        if (!ok) revert WithdrawFailed();
+        emit Withdrawn(recipient, recipient, amount);
+    }
+
     /// @notice Anyone may turn the hook's ERC-6909 ETH claims into ETH and push what is owed to both recipients.
     function redeemClaims() external {
         _redeemClaims();
@@ -314,8 +335,9 @@ contract LaunchHook is IHooks, IUnlockCallback, Ownable {
     }
 
     /// @inheritdoc IHooks
-    /// @dev Takes the fee here when ETH is the unspecified currency (exact-output buy, exact-input sell), and
-    /// pays out whichever fee this swap owes.
+    /// @dev Takes the fee here when ETH is the unspecified currency (exact-output buy, exact-input sell),
+    /// checks a fee taken in `beforeSwap` against the executed fill, and pays out whichever fee this swap owes.
+    /// `delta` is the pool's own leg of the swap, before the hook's deltas are applied.
     function afterSwap(address, PoolKey calldata, SwapParams calldata params, BalanceDelta delta, bytes calldata)
         external
         override
@@ -333,9 +355,24 @@ contract LaunchHook is IHooks, IUnlockCallback, Ownable {
         uint256 gross;
         int128 hookDelta;
         if (exactInput == buy) {
-            // ETH was the specified currency: the fee was already taken in beforeSwap.
+            // ETH was the specified currency: the fee was already taken in beforeSwap, sized from the amount
+            // the swapper specified. `delta` is the pool's own leg (the specified amount minus that fee). It
+            // is smaller when the swap stopped early, at `sqrtPriceLimitX96` or because the pool ran out of
+            // ETH, and the specified delta cannot be adjusted here, so such a partial fill is refused instead
+            // of charging the fee on ETH that was never swapped.
             fee = feeFromBefore;
-            gross = buy ? uint256(-params.amountSpecified) : uint256(params.amountSpecified) + fee;
+            uint256 executed;
+            uint256 assumed;
+            if (buy) {
+                gross = uint256(-params.amountSpecified);
+                assumed = gross - fee;
+                executed = uint256(SafeCast.toUint128(-delta.amount0()));
+            } else {
+                gross = uint256(params.amountSpecified) + fee;
+                assumed = gross;
+                executed = uint256(SafeCast.toUint128(delta.amount0()));
+            }
+            if (executed != assumed) revert PartialFill(assumed, executed);
         } else if (buy) {
             // Exact-output buy: the pool's ETH input is known only now. The swapper pays gross = pool / (1 - rate).
             uint256 poolEth = uint256(SafeCast.toUint128(-delta.amount0()));

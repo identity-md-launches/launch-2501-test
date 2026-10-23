@@ -45,6 +45,25 @@ took in **transient storage** (EIP-1153, `tstore`/`tload`) for `afterSwap`, whic
 `afterSwapReturnDelta` when ETH is the unspecified currency. The LP fee of the pool itself (1.25%, the launch
 policy's tier) is separate and untouched; the hook returns no LP fee override.
 
+### Partial fills
+
+A v4 swap stops early, without reverting, when it reaches `sqrtPriceLimitX96` or when the pool runs out of
+the output currency (this pool holds only the ETH buyers have paid in, so an exact-output sell can ask for
+more than it has). The fee must never exceed the rate on the ETH actually swapped, so:
+
+| Swap type                           | Partial fill                                                        |
+| ----------------------------------- | ------------------------------------------------------------------- |
+| Exact-output buy, exact-input sell  | Allowed. The fee is sized in `afterSwap` from the executed ETH leg. |
+| Exact-input buy, exact-output sell  | **Reverts** with `PartialFill(assumed, executed)`.                  |
+
+For the second row the fee was sized in `beforeSwap` from the requested amount, and v4 gives the hook no way
+to resize the specified (ETH) delta in `afterSwap`. Refunding the excess to the swapper's router would strand
+it in a router that has no sweep step, so the hook refuses the fill instead: `afterSwap` compares the pool's
+executed ETH (`delta.amount0()`) with the amount `beforeSwap` assumed and reverts on any difference. The whole
+swap is undone; nobody pays anything. Routers that use the extreme price limit (the usual case, with slippage
+checked on the output amount) are unaffected; a trader who wants a price-limited partial fill uses an
+exact-output buy or an exact-input sell.
+
 ## Payout
 
 Inside each swap the hook takes the fee ETH from the PoolManager (`take`) and pushes the dev and vault shares
@@ -52,8 +71,10 @@ with a bounded-gas call (`PAYOUT_GAS` = 100,000, enough for any ordinary `receiv
 
 - **A recipient that rejects ETH** (reverting `receive`, or one that needs more gas) does not block the swap:
   its share is credited in `owed[recipient]` and stays in the hook. The recipient pulls it later with
-  `withdraw(address to)`, which forwards all gas and pays the caller's credit to `to`. Only the recipient
-  itself can move its credit; the owner has no access to it.
+  `withdraw(address to)`, which forwards all gas and pays the caller's credit to `to`. Anyone may instead call
+  `withdrawFor(address recipient)`, which pays the recipient's whole credit to the recipient itself with all
+  gas, so a vault contract that has no way to call `withdraw` (or whose `receive` needs more than
+  `PAYOUT_GAS`) is never stuck. Only the recipient can redirect its credit; the owner has no access to it.
 - **A PoolManager that holds less ETH than the fee** (a fresh pool seeded with tokens only, before the first
   buyer's ETH is settled) cannot pay the hook during `afterSwap`. The hook then mints itself an ERC-6909 ETH
   claim for the fee and credits both recipients. Anyone may call `redeemClaims()` to burn the claims, take the
@@ -143,8 +164,10 @@ Build settings (`foundry.toml`): solc 0.8.26, EVM `cancun` (transient storage), 
 
 - **Owner**: may lower fees; should consider renouncing once the schedule is final. Nothing else to run.
 - **Recipients**: if a push ever fails (event `PayoutCredited`), call `withdraw(to)` from the recipient
-  address. The research vault must be able to make that call (or receive ETH normally); as a contract with a
-  payable `receive` it receives pushes directly.
+  address, or have anyone call `withdrawFor(recipient)`. The research vault is a contract with a payable
+  `receive` (about 23k gas on mainnet), so pushes succeed and neither call should be needed.
+- **Traders and front-ends**: an exact-input buy or exact-output sell with a price limit the swap reaches
+  reverts with `PartialFill`. Use the extreme price limit with output-amount slippage, or the other swap type.
 - **Anyone**: if `pendingClaims()` is non-zero (event `FeeDeferredAsClaim`, only expected on a PoolManager with
   no ETH), call `redeemClaims()`.
 - **Monitoring**: `FeeCharged`, `PaidOut`, `PayoutCredited`, `FeeDeferredAsClaim`, `ClaimsRedeemed`,
@@ -174,9 +197,11 @@ forge test
 forge fmt --check
 ```
 
-53 tests in `test/`: exact-input and exact-output buys and sells with exact fee and split assertions; the fee
-at t = 0, 900, 1800, 3599, 3600 and later; a rejecting and a gas-hungry recipient that do not block swaps and
-pull their credit; the fresh-manager claim path and its redemption; owner fee limits (never raise, never below
+67 tests in `test/`: exact-input and exact-output buys and sells with exact fee and split assertions; the fee
+at t = 0, 900, 1800, 3599, 3600 and later; partial fills (price-limited and ETH-exhausted: refused for
+exact-input buys and exact-output sells, charged on the executed amount for the other two types); a rejecting
+and a gas-hungry recipient that do not block swaps and pull their credit, and `withdrawFor` delivering it from
+any caller; the fresh-manager claim path and its redemption; owner fee limits (never raise, never below
 the dev share, launch never below base), non-owner rejection, transfer and renounce; pool binding (second
 initialization, wrong token, no ETH); callback access control; constructor and flag validation; the token's
 supply, metadata and transfers; and the deploy helper. Fuzz tests cover ETH conservation on buys and sells and
