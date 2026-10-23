@@ -1,0 +1,33 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "LaunchHook",
+    "constructorArgs": [
+      "$poolManager",
+      "$token",
+      "$owner",
+      "0x087c0cf0a103aca2c487c5017dbc121ad6c5afee",
+      "0x5cf44fb6a49156125b5f9dfea73e4011534c7944"
+    ],
+    "permissions": [
+      "afterInitialize",
+      "beforeSwap",
+      "afterSwap",
+      "beforeSwapReturnDelta",
+      "afterSwapReturnDelta"
+    ]
+  },
+  "token": {
+    "contract": "LaunchToken",
+    "name": "TEST",
+    "symbol": "TEST",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "LaunchHook implements IHooks directly for one native ETH/LaunchToken pool. Its constructor arguments are PoolManager, launch token, owner, immutable research vault, and immutable dev wallet, in that order; LaunchToken has no constructor arguments. Enabled callbacks accept calls only from the PoolManager. afterInitialize checks the ETH/token pair, records the launch timestamp and pool ID, and rejects subsequent initialization. It accepts the listed LP fee and tick spacing but does not restrict the initializer to a factory or enforce a specific fee or spacing. The initial buy hook fee decays linearly from 30% to 2% over 3600 seconds, reaching 16% at 1800 seconds; sells always use the base fee. Fees apply to gross ETH: exact-input buys and exact-output sells use beforeSwapReturnDelta; exact-output buys and exact-input sells use afterSwapReturnDelta. Fee and rate pass between callbacks through EIP-1153 transient storage. The dev wallet receives 0.5% of gross ETH and the research vault receives the remaining hook fee. These hook fees are additional to the 1.25% LP fee. When the PoolManager holds enough ETH, the hook takes the fee and attempts both payouts in the swap transaction with 100000 gas each. Failed payouts become recipient credits, withdrawable by that recipient through withdraw(to). When the PoolManager lacks enough ETH, including a fresh token-only pool, the hook instead mints ERC-6909 ETH claims and credits both recipients; payout is deferred until redeemClaims() or withdraw(to) redeems the claims after settlement. Same-transaction cash payout therefore depends on the manager's ETH balance. The owner can only lower launch and base fees, with launch at least base and base at least 0.5%, and can transfer or renounce ownership. The hook has no liquidity-management, token-minting, swap-pause or owner-sweep function. Launch liquidity is supplied as tokens only; buyers bring ETH. The listed initialPrice is the launch reference value; the deployer derives the opening price from the separate launch policy. Existing tests deploy the vendored PoolManager locally; they are not mainnet-fork tests."
+}
